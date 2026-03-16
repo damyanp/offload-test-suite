@@ -1,8 +1,8 @@
 #--- source.hlsl
 RWStructuredBuffer<float4> Out_f1x4 : register(u0);
-RWStructuredBuffer<float4> Out_f2x4 : register(u1);
-RWStructuredBuffer<float2> Out_f3x2 : register(u2);
-RWStructuredBuffer<float2> Out_f4x2 : register(u3);
+RWStructuredBuffer<float4> Out_f2x4 : register(u5);
+RWStructuredBuffer<float2> Out_f3x2 : register(u6);
+RWStructuredBuffer<float2> Out_f4x2 : register(u7);
 
 cbuffer example_f1x4 : register(b1) {
     float1x4 M_f1x4;
@@ -150,21 +150,21 @@ DescriptorSets:
     - Name: Out_f2x4
       Kind: RWStructuredBuffer
       DirectXBinding:
-        Register: 1
+        Register: 5
         Space: 0
       VulkanBinding:
         Binding: 5
     - Name: Out_f3x2
       Kind: RWStructuredBuffer
       DirectXBinding:
-        Register: 2
+        Register: 6
         Space: 0
       VulkanBinding:
         Binding: 6
     - Name: Out_f4x2
       Kind: RWStructuredBuffer
       DirectXBinding:
-        Register: 3
+        Register: 7
         Space: 0
       VulkanBinding:
         Binding: 7
@@ -172,10 +172,6 @@ DescriptorSets:
 # Note: Metal and Vulkan KosmicKrisp and MoltenVK
 # Are always empty
 # UNSUPPORTED: Darwin
-
-# Note: NV crashes AMD and Intel Output buffers are empty.
-# Bug https://github.com/microsoft/DirectXShaderCompiler/issues/8218
-# XFAIL: DXC && Vulkan
 
 # Note: clang Vulkan crashes
 # BUG https://github.com/llvm/llvm-project/issues/179879

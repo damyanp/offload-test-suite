@@ -1,8 +1,8 @@
 #--- source.hlsl
 RWStructuredBuffer<float> Out_f4x1 : register(u0);
-RWStructuredBuffer<float> Out_f4x2 : register(u1);
-RWStructuredBuffer<float> Out_f2x3 : register(u2);
-RWStructuredBuffer<float> Out_f2x4 : register(u3);
+RWStructuredBuffer<float> Out_f4x2 : register(u5);
+RWStructuredBuffer<float> Out_f2x3 : register(u6);
+RWStructuredBuffer<float> Out_f2x4 : register(u7);
 
 cbuffer example_f4x1 : register(b1) {
     float4x1 M_f4x1;
@@ -171,21 +171,21 @@ DescriptorSets:
     - Name: Out_f4x2
       Kind: RWStructuredBuffer
       DirectXBinding:
-        Register: 1
+        Register: 5
         Space: 0
       VulkanBinding:
         Binding: 5
     - Name: Out_f2x3
       Kind: RWStructuredBuffer
       DirectXBinding:
-        Register: 2
+        Register: 6
         Space: 0
       VulkanBinding:
         Binding: 6
     - Name: Out_f2x4
       Kind: RWStructuredBuffer
       DirectXBinding:
-        Register: 3
+        Register: 7
         Space: 0
       VulkanBinding:
         Binding: 7
@@ -197,10 +197,6 @@ DescriptorSets:
 # Note: clang Vulkan crashes
 # BUG https://github.com/llvm/llvm-project/issues/179879
 # XFAIL: Clang && Vulkan
-
-# Note: NV crashes AMD and Intel Output buffers are empty.
-# Bug https://github.com/microsoft/DirectXShaderCompiler/issues/8218
-# XFAIL: DXC && Vulkan
 
 # RUN: split-file %s %t
 # RUN: %dxc_target -T cs_6_0 -Zpr -Fo %t.o %t/source.hlsl
