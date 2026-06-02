@@ -20,7 +20,6 @@ void main() {
 Shaders:
   - Stage: Compute
     Entry: main
-    DispatchSize: [1, 1, 1]
 Buffers:
   - Name: In
     Format: Float16
@@ -30,7 +29,7 @@ Buffers:
   - Name: Out
     Format: Float16
     Stride: 8
-    ZeroInitSize: 24
+    FillSize: 24
   - Name: ExpectedOut # The result we expect
     Format: Float16
     Stride: 8

@@ -13,7 +13,6 @@ void CSMain(uint3 TID : SV_GroupThreadID) {
 Shaders:
   - Stage: Compute
     Entry: CSMain
-    DispatchSize: [1, 1, 1]
 Buffers:
   - Name: In
     Format: Int32
@@ -39,9 +38,6 @@ DescriptorSets:
         Binding: 1
 ...
 #--- end
-
-# Tracking issue: https://github.com/llvm/llvm-project/issues/148270
-# XFAIL: Intel
 
 # RUN: split-file %s %t
 # RUN: %dxc_target -T cs_6_0 -E CSMain -Fo %t.o %t/source.hlsl

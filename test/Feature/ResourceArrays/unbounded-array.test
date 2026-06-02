@@ -1,14 +1,15 @@
 #--- source.hlsl
 
-// This test verified handling of unbounded resource array.
+// Verify handling of unbounded resource array.
 
 [[vk::binding(0)]]
 RWBuffer<int> Buf[] : register(u0);
 
 [numthreads(4,2,1)]
-void main(uint GI : SV_GroupIndex) {
+void main() {
   for (int i = 0; i < 4; i++) {
-    Buf[GI][i] = GI * 100 + Buf[GI][i];
+    Buf[1][i] = Buf[0][i] * 2;
+    Buf[2][i] = Buf[0][i] + Buf[1][i];
   }
 }
 
@@ -17,33 +18,22 @@ void main(uint GI : SV_GroupIndex) {
 Shaders:
   - Stage: Compute
     Entry: main
-    DispatchSize: [1, 1, 1]
 Buffers:
   - Name: Buf
     Format: Int32
-    ArraySize: 8
+    ArraySize: 3
     Data:
-      - [ 0, 1, 2, 3 ]
       - [ 1, 2, 3, 4 ]
-      - [ 2, 3, 4, 5 ]
-      - [ 3, 4, 5, 6 ]
-      - [ 4, 5, 6, 7 ]
-      - [ 5, 6, 7, 8 ]
-      - [ 6, 7, 8, 9 ]
-      - [ 7, 8, 9, 10 ]
+      - [ 0, 0, 0, 0 ]
+      - [ 0, 0, 0, 0 ]
 
   - Name: ExpectedBuf
     Format: Int32
-    ArraySize: 8
+    ArraySize: 3
     Data:
-      - [ 0, 1, 2, 3 ]
-      - [ 101, 102, 103, 104 ]
-      - [ 202, 203, 204, 205 ]
-      - [ 303, 304, 305, 306 ]
-      - [ 404, 405, 406, 407 ]
-      - [ 505, 506, 507, 508 ]
-      - [ 606, 607, 608, 609 ]
-      - [ 707, 708, 709, 710 ]
+      - [ 1, 2, 3, 4 ]
+      - [ 2, 4, 6, 8 ]
+      - [ 3, 6, 9, 12 ]
 
 Results:
   - Result: Buf
@@ -63,12 +53,9 @@ DescriptorSets:
 ...
 #--- end
 
-# UNSUPPORTED: Clang
-
-# Resource arrays are not yet supported on Metal
-# UNSUPPORTED: Metal
+# Unimplemented https://github.com/llvm/offload-test-suite/issues/305
+# XFAIL: DXC && Vulkan && KosmicKrisp
 
 # RUN: split-file %s %t
-# RUN: %if !Vulkan %{ %dxc_target -T cs_6_0 -Fo %t.o %t/source.hlsl %}
-# RUN: %if Vulkan %{ %dxc_target -T cs_6_0 -fspv-target-env=vulkan1.3 -fvk-use-scalar-layout -Fo %t.o %t/source.hlsl %}
+# RUN: %dxc_target -T cs_6_0 -Fo %t.o %t/source.hlsl
 # RUN: %offloader %t/pipeline.yaml %t.o

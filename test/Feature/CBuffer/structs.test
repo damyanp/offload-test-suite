@@ -60,7 +60,6 @@ void main() {
 Shaders:
   - Stage: Compute
     Entry: main
-    DispatchSize: [1, 1, 1]
 Buffers:
   - Name: CBVectors
     Format: Hex32
@@ -78,7 +77,7 @@ Buffers:
   - Name: Out
     Format: Hex32
     Stride: 60
-    ZeroInitSize: 60
+    FillSize: 60
 DescriptorSets:
   - Resources:
     - Name: CBVectors
@@ -86,23 +85,26 @@ DescriptorSets:
       DirectXBinding:
         Register: 0
         Space: 0
+      VulkanBinding:
+        Binding: 0
     - Name: Out
       Kind: RWStructuredBuffer
       DirectXBinding:
         Register: 1
         Space: 0
+      VulkanBinding:
+        Binding: 1
 ...
 #--- end
 
-# DXC's vulkan support does not layout cbuffers compatibly with DXIL
-# UNSUPPORTED: Vulkan
+# Unimplemented https://github.com/llvm/llvm-project/issues/186465
+# XFAIL: Clang && Vulkan
 
-+# Clang trips on 2-element vectors in structs:
-+# https://github.com/llvm/llvm-project/issues/123968
-+# XFAIL: Clang
+# Bug https://github.com/KhronosGroup/SPIRV-Cross/issues/2595
+# XFAIL: Vulkan && MoltenVK
 
 # RUN: split-file %s %t
-# RUN: %dxc_target -T cs_6_5 -Fo %t.o %t/source.hlsl
+# RUN: %dxc_target -fvk-use-dx-layout -T cs_6_5 -Fo %t.o %t/source.hlsl
 # RUN: %offloader %t/pipeline.yaml %t.o | FileCheck %s
 
 # CHECK: - Name: CBVectors

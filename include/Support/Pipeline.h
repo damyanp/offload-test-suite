@@ -13,17 +13,43 @@
 #ifndef OFFLOADTEST_SUPPORT_PIPELINE_H
 #define OFFLOADTEST_SUPPORT_PIPELINE_H
 
+#include "API/Enums.h"
+#include "API/Resources.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/YAMLTraits.h"
+#include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 
 namespace offloadtest {
 
-enum class Stages { Compute };
+enum class Stages {
+  // Compute
+  Compute,
+
+  // Traditional Raster
+  Vertex,
+  Hull,
+  Domain,
+  Geometry,
+  Pixel,
+
+  // Mesh Shader Raster
+  Amplification,
+  Mesh
+};
+inline constexpr std::array AllStages = {
+    Stages::Compute,  Stages::Vertex, Stages::Hull,          Stages::Domain,
+    Stages::Geometry, Stages::Pixel,  Stages::Amplification, Stages::Mesh,
+};
+inline constexpr size_t NumStages = AllStages.size();
+
+enum class ShaderPipelineKind { Compute, TraditionalRaster, MeshShaderRaster };
 
 enum class Rule { BufferExact, BufferFloatULP, BufferFloatEpsilon };
 
@@ -43,19 +69,65 @@ enum class DataFormat {
   Float16,
   Float32,
   Float64,
+  Depth32,
   Bool,
 };
 
-enum class ResourceKind {
-  Buffer,
-  StructuredBuffer,
-  ByteAddressBuffer,
-  Texture2D,
-  RWBuffer,
-  RWStructuredBuffer,
-  RWByteAddressBuffer,
-  RWTexture2D,
-  ConstantBuffer,
+enum class DescriptorKind { UAV, SRV, CBV, SAMPLER };
+
+static inline DescriptorKind getDescriptorKind(ResourceKind RK) {
+  switch (RK) {
+  case ResourceKind::Buffer:
+  case ResourceKind::StructuredBuffer:
+  case ResourceKind::ByteAddressBuffer:
+  case ResourceKind::Texture2D:
+  case ResourceKind::AccelerationStructure:
+    return DescriptorKind::SRV;
+
+  case ResourceKind::RWStructuredBuffer:
+  case ResourceKind::RWBuffer:
+  case ResourceKind::RWByteAddressBuffer:
+  case ResourceKind::RWTexture2D:
+    return DescriptorKind::UAV;
+
+  case ResourceKind::ConstantBuffer:
+    return DescriptorKind::CBV;
+
+  case ResourceKind::Sampler:
+    return DescriptorKind::SAMPLER;
+  case ResourceKind::SampledTexture2D:
+    llvm_unreachable("Sampled textures aren't supported!");
+  }
+  llvm_unreachable("All cases handled");
+}
+
+enum class FilterMode { Nearest, Linear };
+
+enum class AddressMode { Clamp, Repeat, Mirror, Border, MirrorOnce };
+
+enum class CompareFunction {
+  Never,
+  Less,
+  Equal,
+  LessEqual,
+  Greater,
+  NotEqual,
+  GreaterEqual,
+  Always
+};
+
+enum class SamplerKind { Sampler, SamplerComparison };
+
+struct Sampler {
+  std::string Name;
+  FilterMode MinFilter = FilterMode::Linear;
+  FilterMode MagFilter = FilterMode::Linear;
+  AddressMode Address = AddressMode::Clamp;
+  float MinLOD = 0.0f;
+  float MaxLOD = std::numeric_limits<float>::max();
+  float MipLODBias = 0.0f;
+  CompareFunction ComparisonOp = CompareFunction::Never;
+  SamplerKind Kind = SamplerKind::Sampler;
 };
 
 struct DirectXBinding {
@@ -65,15 +137,42 @@ struct DirectXBinding {
 
 struct VulkanBinding {
   uint32_t Binding;
+  std::optional<uint32_t> CounterBinding;
 };
 
 struct OutputProperties {
   int Height;
   int Width;
   int Depth;
+  int MipLevels = 1;
 };
 
-struct Buffer {
+static inline uint32_t getFormatSize(DataFormat Format) {
+  switch (Format) {
+  case DataFormat::Hex8:
+    return 1;
+  case DataFormat::Hex16:
+  case DataFormat::UInt16:
+  case DataFormat::Int16:
+  case DataFormat::Float16:
+    return 2;
+  case DataFormat::Hex32:
+  case DataFormat::UInt32:
+  case DataFormat::Int32:
+  case DataFormat::Float32:
+  case DataFormat::Depth32:
+  case DataFormat::Bool:
+    return 4;
+  case DataFormat::Hex64:
+  case DataFormat::UInt64:
+  case DataFormat::Int64:
+  case DataFormat::Float64:
+    return 8;
+  }
+  llvm_unreachable("All cases covered.");
+}
+
+struct CPUBuffer {
   std::string Name;
   DataFormat Format;
   int Channels;
@@ -90,35 +189,26 @@ struct Buffer {
 
   uint32_t size() const { return Size; }
 
-  uint32_t getSingleElementSize() const {
-    switch (Format) {
-    case DataFormat::Hex8:
-      return 1;
-    case DataFormat::Hex16:
-    case DataFormat::UInt16:
-    case DataFormat::Int16:
-    case DataFormat::Float16:
-      return 2;
-    case DataFormat::Hex32:
-    case DataFormat::UInt32:
-    case DataFormat::Int32:
-    case DataFormat::Float32:
-    case DataFormat::Bool:
-      return 4;
-    case DataFormat::Hex64:
-    case DataFormat::UInt64:
-    case DataFormat::Int64:
-    case DataFormat::Float64:
-      return 8;
-    }
-    llvm_unreachable("All cases covered.");
-  }
+  uint32_t getSingleElementSize() const { return getFormatSize(Format); }
 
   uint32_t getElementSize() const {
     if (Stride > 0)
       return Stride;
     return getSingleElementSize() * Channels;
   }
+
+  // The natural per-row byte size of this buffer when interpreted as a 2D
+  // image (no padding).
+  uint32_t getImageRowBytes() const {
+    return OutputProps.Width * getElementSize();
+  }
+
+  // Copy a 2D image readback from a GPU mapping into Data[0]. The host
+  // buffer is tightly packed with top-left origin. SrcRowPitch is the
+  // source's per-row stride in bytes; pass `getImageRowBytes()` when the
+  // source is tightly packed (Vulkan / Metal), or the GPU's reported pitch
+  // when the source has row padding (e.g., D3D12's 256-byte aligned rows).
+  void copyFromTexture(const void *Src, size_t SrcRowPitch);
 };
 
 struct Result {
@@ -126,20 +216,30 @@ struct Result {
   Rule ComparisonRule;
   std::string Actual;
   std::string Expected;
-  Buffer *ActualPtr = nullptr;
-  Buffer *ExpectedPtr = nullptr;
+  CPUBuffer *ActualPtr = nullptr;
+  CPUBuffer *ExpectedPtr = nullptr;
   DenormMode DM = DenormMode::Any;
   unsigned ULPT; // ULP Tolerance
   double Epsilon;
 };
+
+struct TLASDesc;
 
 struct Resource {
   ResourceKind Kind;
   std::string Name;
   DirectXBinding DXBinding;
   std::optional<VulkanBinding> VKBinding;
-  Buffer *BufferPtr = nullptr;
+  CPUBuffer *BufferPtr = nullptr;
+  Sampler *SamplerPtr = nullptr;
   bool HasCounter;
+  std::optional<uint32_t> TilesMapped;
+  bool IsReserved = false;
+  TLASDesc *TLASPtr = nullptr;
+
+  bool isAccelerationStructure() const {
+    return Kind == ResourceKind::AccelerationStructure;
+  }
 
   bool isRaw() const {
     switch (Kind) {
@@ -147,6 +247,9 @@ struct Resource {
     case ResourceKind::RWBuffer:
     case ResourceKind::Texture2D:
     case ResourceKind::RWTexture2D:
+    case ResourceKind::Sampler:
+    case ResourceKind::SampledTexture2D:
+    case ResourceKind::AccelerationStructure:
       return false;
     case ResourceKind::StructuredBuffer:
     case ResourceKind::RWStructuredBuffer:
@@ -154,6 +257,26 @@ struct Resource {
     case ResourceKind::RWByteAddressBuffer:
     case ResourceKind::ConstantBuffer:
       return true;
+    }
+    llvm_unreachable("All cases handled");
+  }
+
+  bool isSampler() const {
+    switch (Kind) {
+    case ResourceKind::Sampler:
+      return true;
+    case ResourceKind::Buffer:
+    case ResourceKind::RWBuffer:
+    case ResourceKind::StructuredBuffer:
+    case ResourceKind::RWStructuredBuffer:
+    case ResourceKind::ByteAddressBuffer:
+    case ResourceKind::RWByteAddressBuffer:
+    case ResourceKind::ConstantBuffer:
+    case ResourceKind::Texture2D:
+    case ResourceKind::RWTexture2D:
+    case ResourceKind::SampledTexture2D:
+    case ResourceKind::AccelerationStructure:
+      return false;
     }
     llvm_unreachable("All cases handled");
   }
@@ -167,9 +290,12 @@ struct Resource {
     case ResourceKind::ByteAddressBuffer:
     case ResourceKind::RWByteAddressBuffer:
     case ResourceKind::ConstantBuffer:
+    case ResourceKind::Sampler:
+    case ResourceKind::AccelerationStructure:
       return false;
     case ResourceKind::Texture2D:
     case ResourceKind::RWTexture2D:
+    case ResourceKind::SampledTexture2D:
       return true;
     }
     llvm_unreachable("All cases handled");
@@ -195,9 +321,34 @@ struct Resource {
     }
   }
 
-  uint32_t getElementSize() const { return BufferPtr->getElementSize(); }
+  bool isSampledTexture() const {
+    switch (Kind) {
+    case ResourceKind::SampledTexture2D:
+      return true;
+    default:
+      return false;
+    }
+  }
 
-  uint32_t size() const { return BufferPtr->size(); }
+  uint32_t getElementSize() const {
+    assert(!isSampler() && !isAccelerationStructure() &&
+           "Samplers and AS do not have element size");
+    // ByteAddressBuffers are treated as 4-byte elements to match their memory
+    // format.
+    return isByteAddressBuffer() ? 4 : BufferPtr->getElementSize();
+  }
+
+  uint32_t getArraySize() const {
+    if (isSampler() || isAccelerationStructure())
+      return 1;
+    return BufferPtr->ArraySize;
+  }
+
+  uint32_t size() const {
+    assert(!isSampler() && !isAccelerationStructure() &&
+           "Samplers and AS do not have size");
+    return BufferPtr->size();
+  }
 
   bool isReadWrite() const {
     switch (Kind) {
@@ -206,6 +357,9 @@ struct Resource {
     case ResourceKind::ByteAddressBuffer:
     case ResourceKind::Texture2D:
     case ResourceKind::ConstantBuffer:
+    case ResourceKind::Sampler:
+    case ResourceKind::SampledTexture2D:
+    case ResourceKind::AccelerationStructure:
       return false;
     case ResourceKind::RWBuffer:
     case ResourceKind::RWStructuredBuffer:
@@ -222,7 +376,6 @@ struct Resource {
 struct DescriptorSet {
   llvm::SmallVector<Resource> Resources;
 };
-
 namespace dx {
 enum class RootParamKind {
   Constant,
@@ -233,7 +386,7 @@ enum class RootParamKind {
 struct RootResource : public Resource {};
 
 struct RootConstant {
-  Buffer *BufferPtr;
+  CPUBuffer *BufferPtr;
   std::string Name;
 };
 
@@ -251,19 +404,152 @@ struct RuntimeSettings {
   dx::Settings DX;
 };
 
+struct VertexAttribute {
+  DataFormat Format;
+  int Channels;
+  int Offset;
+  std::string Name;
+
+  uint32_t size() const { return getFormatSize(Format) * Channels; }
+};
+
+struct IOBindings {
+  std::string VertexBuffer;
+  CPUBuffer *VertexBufferPtr = nullptr;
+  llvm::SmallVector<VertexAttribute> VertexAttributes;
+
+  std::string RenderTarget;
+  CPUBuffer *RTargetBufferPtr = nullptr;
+  PrimitiveTopology Topology = PrimitiveTopology::TriangleList;
+
+  // Set if Topology == PatchList. Validated in
+  // Pipeline.cpp::validatePipelineKind. Valid range is 1..32 (matches both
+  // D3D12's per-CP-patchlist topologies and Vulkan's
+  // VkPipelineTessellationStateCreateInfo::patchControlPoints).
+  std::optional<uint32_t> PatchControlPoints;
+
+  uint32_t getVertexStride() const {
+    uint32_t Stride = 0;
+    for (auto VA : VertexAttributes)
+      Stride += VA.size();
+    return Stride;
+  }
+};
+
+// Describes a contiguous group of bytes in a push constant block.
+struct PushConstantValue {
+  // Format used to describe those bytes in the YAML.
+  DataFormat Format;
+  // The bytes of this group.
+  llvm::SmallVector<char, 4> Data;
+  // The offset of this group from the start of the push constant buffer.
+  uint32_t OffsetInBytes;
+};
+
+// Describes the content of the push constant buffer.
+struct PushConstantBlock {
+  // The stages this is push constant is active for.
+  Stages Stage;
+
+  // The values/group of values composing this buffer.
+  llvm::SmallVector<PushConstantValue> Values;
+
+  // True if there are no push constants.
+  bool empty() const { return size() == 0; }
+
+  // Layout the push constant content in output.
+  void getContent(llvm::SmallVectorImpl<uint8_t> &Output) const;
+
+  // Returns the size in bytes of the whole push constant once laid out.
+  uint32_t size() const;
+};
+
+struct SpecializationConstant {
+  uint32_t ConstantID;
+  DataFormat Type;
+  std::string Value;
+};
+
 struct Shader {
   Stages Stage;
   std::string Entry;
   std::unique_ptr<llvm::MemoryBuffer> Shader;
-  int DispatchSize[3];
+  llvm::SmallVector<SpecializationConstant> SpecializationConstants;
+};
+
+struct DispatchParametersSet {
+  std::array<uint32_t, 3> DispatchGroupCount = {1, 1, 1};
+  std::optional<uint32_t> VertexCount;
+};
+
+struct TriangleGeometry {
+  std::string VertexBuffer;
+  CPUBuffer *VertexBufferPtr = nullptr;
+  Format VertexFormat = Format::RGB32Float;
+  uint32_t VertexStride = 12;
+  uint32_t VertexCount = 0;
+  std::string IndexBuffer;
+  CPUBuffer *IndexBufferPtr = nullptr;
+  IndexFormat IdxFormat = IndexFormat::Uint32;
+  uint32_t IndexCount = 0;
+  bool Opaque = true;
+};
+
+struct AABBGeometry {
+  std::string AABBBuffer;
+  CPUBuffer *AABBBufferPtr = nullptr;
+  uint32_t AABBCount = 0;
+  uint32_t AABBStride = 24;
+  bool Opaque = true;
+};
+
+struct BLASDesc {
+  std::string Name;
+  llvm::SmallVector<TriangleGeometry> Triangles;
+  llvm::SmallVector<AABBGeometry> AABBs;
+};
+
+struct InstanceDesc {
+  std::string BLAS;
+  int BLASIdx = -1;
+  float Transform[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+  uint32_t InstanceID = 0;
+  uint8_t InstanceMask = 0xFF;
+};
+
+struct TLASDesc {
+  std::string Name;
+  llvm::SmallVector<InstanceDesc> Instances;
+};
+
+struct AccelerationStructureDescs {
+  llvm::SmallVector<BLASDesc, 1> BLAS;
+  llvm::SmallVector<TLASDesc, 1> TLAS;
 };
 
 struct Pipeline {
+  ShaderPipelineKind Kind;
   llvm::SmallVector<Shader> Shaders;
   RuntimeSettings Settings;
-  llvm::SmallVector<Buffer> Buffers;
+
+  IOBindings Bindings;
+  llvm::SmallVector<PushConstantBlock> PushConstants;
+  llvm::SmallVector<CPUBuffer> Buffers;
+  llvm::SmallVector<Sampler> Samplers;
   llvm::SmallVector<Result> Results;
   llvm::SmallVector<DescriptorSet> Sets;
+  DispatchParametersSet DispatchParameters;
+  AccelerationStructureDescs AccelStructs;
+
+  uint32_t getVertexCount() const {
+    if (DispatchParameters.VertexCount)
+      return *DispatchParameters.VertexCount;
+
+    assert(Bindings.VertexBufferPtr != nullptr &&
+           "No VertexCount specified and no Vertex Buffer available to imply "
+           "VertexCount from.");
+    return Bindings.VertexBufferPtr->size() / Bindings.getVertexStride();
+  }
 
   uint32_t getDescriptorCount() const {
     uint32_t DescriptorCount = 0;
@@ -276,25 +562,71 @@ struct Pipeline {
     uint32_t DescriptorCount = 0;
     for (auto &D : Sets)
       for (auto &R : D.Resources)
-        DescriptorCount += R.BufferPtr->ArraySize;
+        DescriptorCount += R.getArraySize();
     return DescriptorCount;
   }
 
-  Buffer *getBuffer(llvm::StringRef Name) {
+  CPUBuffer *getBuffer(llvm::StringRef Name) {
     for (auto &B : Buffers)
       if (Name == B.Name)
         return &B;
     return nullptr;
+  }
+
+  Sampler *getSampler(llvm::StringRef Name) {
+    for (auto &S : Samplers)
+      if (Name == S.Name)
+        return &S;
+    return nullptr;
+  }
+
+  BLASDesc *getBLAS(llvm::StringRef Name) {
+    for (auto &B : AccelStructs.BLAS)
+      if (Name == B.Name)
+        return &B;
+    return nullptr;
+  }
+
+  TLASDesc *getTLAS(llvm::StringRef Name) {
+    for (auto &T : AccelStructs.TLAS)
+      if (Name == T.Name)
+        return &T;
+    return nullptr;
+  }
+
+  llvm::Error validatePipelineKind();
+  llvm::Error validateDispatchParameters();
+
+  bool isCompute() const { return Kind == ShaderPipelineKind::Compute; }
+  bool isTraditionalRaster() const {
+    return Kind == ShaderPipelineKind::TraditionalRaster;
+  }
+  bool isMeshShaderRaster() const {
+    return Kind == ShaderPipelineKind::MeshShaderRaster;
+  }
+  bool isRaster() const {
+    return isTraditionalRaster() || isMeshShaderRaster();
   }
 };
 } // namespace offloadtest
 
 LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::DescriptorSet)
 LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::Resource)
-LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::Buffer)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::CPUBuffer)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::Sampler)
 LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::Shader)
 LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::dx::RootParameter)
 LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::Result)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::VertexAttribute)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::SpecializationConstant)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::PushConstantBlock)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::PushConstantValue)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::DispatchParametersSet)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::TriangleGeometry)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::AABBGeometry)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::BLASDesc)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::InstanceDesc)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::TLASDesc)
 
 namespace llvm {
 namespace yaml {
@@ -307,8 +639,12 @@ template <> struct MappingTraits<offloadtest::DescriptorSet> {
   static void mapping(IO &I, offloadtest::DescriptorSet &D);
 };
 
-template <> struct MappingTraits<offloadtest::Buffer> {
-  static void mapping(IO &I, offloadtest::Buffer &R);
+template <> struct MappingTraits<offloadtest::CPUBuffer> {
+  static void mapping(IO &I, offloadtest::CPUBuffer &R);
+};
+
+template <> struct MappingTraits<offloadtest::Sampler> {
+  static void mapping(IO &I, offloadtest::Sampler &S);
 };
 
 template <> struct MappingTraits<offloadtest::Result> {
@@ -325,6 +661,26 @@ template <> struct MappingTraits<offloadtest::DirectXBinding> {
 
 template <> struct MappingTraits<offloadtest::VulkanBinding> {
   static void mapping(IO &I, offloadtest::VulkanBinding &B);
+};
+
+template <> struct MappingTraits<offloadtest::IOBindings> {
+  static void mapping(IO &I, offloadtest::IOBindings &B);
+};
+
+template <> struct MappingTraits<offloadtest::PushConstantValue> {
+  static void mapping(IO &I, offloadtest::PushConstantValue &B);
+};
+
+template <> struct MappingTraits<offloadtest::PushConstantBlock> {
+  static void mapping(IO &I, offloadtest::PushConstantBlock &B);
+};
+
+template <> struct MappingTraits<offloadtest::DispatchParametersSet> {
+  static void mapping(IO &I, offloadtest::DispatchParametersSet &B);
+};
+
+template <> struct MappingTraits<offloadtest::VertexAttribute> {
+  static void mapping(IO &I, offloadtest::VertexAttribute &A);
 };
 
 template <> struct MappingTraits<offloadtest::OutputProperties> {
@@ -351,6 +707,34 @@ template <> struct MappingTraits<offloadtest::RuntimeSettings> {
   static void mapping(IO &I, offloadtest::RuntimeSettings &S);
 };
 
+template <> struct MappingTraits<offloadtest::SpecializationConstant> {
+  static void mapping(IO &I, offloadtest::SpecializationConstant &C);
+};
+
+template <> struct MappingTraits<offloadtest::TriangleGeometry> {
+  static void mapping(IO &I, offloadtest::TriangleGeometry &G);
+};
+
+template <> struct MappingTraits<offloadtest::AABBGeometry> {
+  static void mapping(IO &I, offloadtest::AABBGeometry &G);
+};
+
+template <> struct MappingTraits<offloadtest::BLASDesc> {
+  static void mapping(IO &I, offloadtest::BLASDesc &D);
+};
+
+template <> struct MappingTraits<offloadtest::InstanceDesc> {
+  static void mapping(IO &I, offloadtest::InstanceDesc &D);
+};
+
+template <> struct MappingTraits<offloadtest::TLASDesc> {
+  static void mapping(IO &I, offloadtest::TLASDesc &D);
+};
+
+template <> struct MappingTraits<offloadtest::AccelerationStructureDescs> {
+  static void mapping(IO &I, offloadtest::AccelerationStructureDescs &D);
+};
+
 template <> struct ScalarEnumerationTraits<offloadtest::Rule> {
   static void enumeration(IO &I, offloadtest::Rule &V) {
 #define ENUM_CASE(Val) I.enumCase(V, #Val, offloadtest::Rule::Val)
@@ -371,6 +755,51 @@ template <> struct ScalarEnumerationTraits<offloadtest::DenormMode> {
   }
 };
 
+template <> struct ScalarEnumerationTraits<offloadtest::FilterMode> {
+  static void enumeration(IO &I, offloadtest::FilterMode &V) {
+#define ENUM_CASE(Val) I.enumCase(V, #Val, offloadtest::FilterMode::Val)
+    ENUM_CASE(Nearest);
+    ENUM_CASE(Linear);
+#undef ENUM_CASE
+  }
+};
+
+template <> struct ScalarEnumerationTraits<offloadtest::AddressMode> {
+  static void enumeration(IO &I, offloadtest::AddressMode &V) {
+#define ENUM_CASE(Val) I.enumCase(V, #Val, offloadtest::AddressMode::Val)
+    ENUM_CASE(Clamp);
+    ENUM_CASE(Repeat);
+    ENUM_CASE(Mirror);
+    ENUM_CASE(Border);
+    ENUM_CASE(MirrorOnce);
+#undef ENUM_CASE
+  }
+};
+
+template <> struct ScalarEnumerationTraits<offloadtest::CompareFunction> {
+  static void enumeration(IO &I, offloadtest::CompareFunction &V) {
+#define ENUM_CASE(Val) I.enumCase(V, #Val, offloadtest::CompareFunction::Val)
+    ENUM_CASE(Never);
+    ENUM_CASE(Less);
+    ENUM_CASE(Equal);
+    ENUM_CASE(LessEqual);
+    ENUM_CASE(Greater);
+    ENUM_CASE(NotEqual);
+    ENUM_CASE(GreaterEqual);
+    ENUM_CASE(Always);
+#undef ENUM_CASE
+  }
+};
+
+template <> struct ScalarEnumerationTraits<offloadtest::SamplerKind> {
+  static void enumeration(IO &I, offloadtest::SamplerKind &V) {
+#define ENUM_CASE(Val) I.enumCase(V, #Val, offloadtest::SamplerKind::Val)
+    ENUM_CASE(Sampler);
+    ENUM_CASE(SamplerComparison);
+#undef ENUM_CASE
+  }
+};
+
 template <> struct ScalarEnumerationTraits<offloadtest::DataFormat> {
   static void enumeration(IO &I, offloadtest::DataFormat &V) {
 #define ENUM_CASE(Val) I.enumCase(V, #Val, offloadtest::DataFormat::Val)
@@ -387,6 +816,7 @@ template <> struct ScalarEnumerationTraits<offloadtest::DataFormat> {
     ENUM_CASE(Float16);
     ENUM_CASE(Float32);
     ENUM_CASE(Float64);
+    ENUM_CASE(Depth32);
     ENUM_CASE(Bool);
 #undef ENUM_CASE
   }
@@ -404,6 +834,43 @@ template <> struct ScalarEnumerationTraits<offloadtest::ResourceKind> {
     ENUM_CASE(RWByteAddressBuffer);
     ENUM_CASE(RWTexture2D);
     ENUM_CASE(ConstantBuffer);
+    ENUM_CASE(Sampler);
+    ENUM_CASE(SampledTexture2D);
+    ENUM_CASE(AccelerationStructure);
+#undef ENUM_CASE
+  }
+};
+
+template <> struct ScalarEnumerationTraits<offloadtest::Format> {
+  static void enumeration(IO &I, offloadtest::Format &V) {
+#define ENUM_CASE(Val) I.enumCase(V, #Val, offloadtest::Format::Val)
+    ENUM_CASE(R16Sint);
+    ENUM_CASE(R16Uint);
+    ENUM_CASE(RG16Sint);
+    ENUM_CASE(RG16Uint);
+    ENUM_CASE(RGBA16Sint);
+    ENUM_CASE(RGBA16Uint);
+    ENUM_CASE(R32Sint);
+    ENUM_CASE(R32Uint);
+    ENUM_CASE(R32Float);
+    ENUM_CASE(RG32Sint);
+    ENUM_CASE(RG32Uint);
+    ENUM_CASE(RG32Float);
+    ENUM_CASE(RGB32Float);
+    ENUM_CASE(RGBA32Sint);
+    ENUM_CASE(RGBA32Uint);
+    ENUM_CASE(RGBA32Float);
+    ENUM_CASE(D32Float);
+    ENUM_CASE(D32FloatS8Uint);
+#undef ENUM_CASE
+  }
+};
+
+template <> struct ScalarEnumerationTraits<offloadtest::IndexFormat> {
+  static void enumeration(IO &I, offloadtest::IndexFormat &V) {
+#define ENUM_CASE(Val) I.enumCase(V, #Val, offloadtest::IndexFormat::Val)
+    ENUM_CASE(Uint16);
+    ENUM_CASE(Uint32);
 #undef ENUM_CASE
   }
 };
@@ -412,6 +879,23 @@ template <> struct ScalarEnumerationTraits<offloadtest::Stages> {
   static void enumeration(IO &I, offloadtest::Stages &V) {
 #define ENUM_CASE(Val) I.enumCase(V, #Val, offloadtest::Stages::Val)
     ENUM_CASE(Compute);
+    ENUM_CASE(Vertex);
+    ENUM_CASE(Hull);
+    ENUM_CASE(Domain);
+    ENUM_CASE(Geometry);
+    ENUM_CASE(Pixel);
+    ENUM_CASE(Amplification);
+    ENUM_CASE(Mesh);
+#undef ENUM_CASE
+  }
+};
+
+template <> struct ScalarEnumerationTraits<offloadtest::PrimitiveTopology> {
+  static void enumeration(IO &I, offloadtest::PrimitiveTopology &V) {
+#define ENUM_CASE(Val) I.enumCase(V, #Val, offloadtest::PrimitiveTopology::Val)
+    ENUM_CASE(TriangleList);
+    ENUM_CASE(PointList);
+    ENUM_CASE(PatchList);
 #undef ENUM_CASE
   }
 };
@@ -427,27 +911,27 @@ template <> struct ScalarEnumerationTraits<offloadtest::dx::RootParamKind> {
 };
 
 template <typename T> struct SequenceTraits<SmallVector<SmallVector<T>>> {
-  static size_t size(IO &io, SmallVector<SmallVector<T>> &seq) {
-    return seq.size();
+  static size_t size(IO &Io, SmallVector<SmallVector<T>> &Seq) {
+    return Seq.size();
   }
 
-  static SmallVector<T> &element(IO &io, SmallVector<SmallVector<T>> &seq,
-                                 size_t index) {
-    if (index >= seq.size())
-      seq.resize(index + 1);
-    return seq[index];
+  static SmallVector<T> &element(IO &Io, SmallVector<SmallVector<T>> &Seq,
+                                 size_t Index) {
+    if (Index >= Seq.size())
+      Seq.resize(Index + 1);
+    return Seq[Index];
   }
 };
 
 template <typename T> struct SequenceTraits<SmallVector<MutableArrayRef<T>>> {
-  static size_t size(IO &io, SmallVector<MutableArrayRef<T>> &seq) {
-    return seq.size();
+  static size_t size(IO &Io, SmallVector<MutableArrayRef<T>> &Seq) {
+    return Seq.size();
   }
 
   static MutableArrayRef<T> &
-  element(IO &io, SmallVector<MutableArrayRef<T>> &seq, size_t index) {
-    assert(index < seq.size());
-    return seq[index];
+  element(IO &Io, SmallVector<MutableArrayRef<T>> &Seq, size_t Index) {
+    assert(Index < Seq.size());
+    return Seq[Index];
   }
 };
 

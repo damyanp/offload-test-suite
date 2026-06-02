@@ -42,7 +42,6 @@ void main() {
 Shaders:
   - Stage: Compute
     Entry: main
-    DispatchSize: [1, 1, 1]
 Buffers:
   - Name: X0
     Format: Int64
@@ -63,7 +62,7 @@ Buffers:
   - Name: Out0
     Format: Int64
     Stride: 8
-    ZeroInitSize: 64
+    FillSize: 64
   - Name: ExpectedOut0
     Format: Int64
     Stride: 8
@@ -71,7 +70,7 @@ Buffers:
   - Name: Out1
     Format: UInt64
     Stride: 8
-    ZeroInitSize: 64
+    FillSize: 64
   - Name: ExpectedOut1
     Format: UInt64
     Stride: 8
@@ -130,6 +129,9 @@ DescriptorSets:
       VulkanBinding:
         Binding: 5
 #--- end
+
+# Bug https://github.com/llvm/offload-test-suite/issues/569
+# XFAIL: QC && Vulkan && Clang
 
 # REQUIRES: Int64
 # RUN: split-file %s %t

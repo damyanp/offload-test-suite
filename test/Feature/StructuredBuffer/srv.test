@@ -15,7 +15,6 @@ void main(uint GI : SV_GroupIndex) {
 Shaders:
   - Stage: Compute
     Entry: main
-    DispatchSize: [1, 1, 1]
 Buffers:
   - Name: In
     Format: Hex32
@@ -24,7 +23,7 @@ Buffers:
   - Name: Out
     Format: Hex32
     Stride: 16
-    ZeroInitSize: 16
+    FillSize: 16
 DescriptorSets:
   - Resources:
     - Name: In
@@ -43,9 +42,6 @@ DescriptorSets:
         Binding: 1
 ...
 #--- end
-
-# https://github.com/llvm/llvm-project/issues/140739
-# UNSUPPORTED: Clang-Vulkan
 
 # RUN: split-file %s %t
 # RUN: %dxc_target -T cs_6_0 -Fo %t.o %t/source.hlsl

@@ -10,76 +10,166 @@
 //===----------------------------------------------------------------------===//
 
 #include "API/Device.h"
+#include "API/Encoder.h"
+#include "API/FormatConversion.h"
 
 #include "Config.h"
 
 #include "llvm/Support/Error.h"
+#include "llvm/Support/raw_ostream.h"
 
-#include <cstdlib>
 #include <memory>
 
 using namespace offloadtest;
 
-namespace {
-class DeviceContext {
-public:
-  using DeviceArray = Device::DeviceArray;
-  using DeviceIterator = Device::DeviceIterator;
+CommandEncoder::~CommandEncoder() {}
 
-private:
-  DeviceArray Devices;
+Buffer::~Buffer() {}
 
-  DeviceContext() = default;
-  ~DeviceContext() = default;
-  DeviceContext(const DeviceContext &) = delete;
+CommandBuffer::~CommandBuffer() {}
 
-public:
-  static DeviceContext &instance() {
-    static DeviceContext Ctx;
-    return Ctx;
-  }
+Fence::~Fence() {}
 
-  void registerDevice(std::shared_ptr<Device> D) { Devices.push_back(D); }
-  void unregisterDevices() { Devices.clear(); }
+Queue::~Queue() {}
 
-  DeviceIterator begin() { return Devices.begin(); }
+Texture::~Texture() {}
 
-  DeviceIterator end() { return Devices.end(); }
-};
-} // namespace
+RenderPass::~RenderPass() {}
 
 Device::~Device() {}
 
-void Device::registerDevice(std::shared_ptr<Device> D) {
-  DeviceContext::instance().registerDevice(D);
-}
+llvm::Expected<llvm::SmallVector<std::unique_ptr<Device>>>
+offloadtest::initializeDevices(const DeviceConfig Config) {
+  llvm::SmallVector<std::unique_ptr<Device>> Devices;
+  llvm::Error Err = llvm::Error::success();
 
-llvm::Error Device::initialize() {
 #ifdef OFFLOADTEST_ENABLE_D3D12
-  if (auto Err = initializeDXDevices())
-    return Err;
+  if (auto E = initializeDX12Devices(Config, Devices))
+    Err = llvm::joinErrors(std::move(Err), std::move(E));
 #endif
+
 #ifdef OFFLOADTEST_ENABLE_VULKAN
-  if (auto Err = initializeVKDevices())
-    return Err;
-  // Validation layers have internal state which require a specific destruction
-  // ordering. Relying on the global dtor call for this is unreliable and can
-  // cause a null-deref in the validation layers during the final
-  // vkDestroyInstance. This is a known limitation of the validation layers
-  // which explicitely requires using atexit.
-  atexit(Device::cleanupVKDevices);
+  if (auto E = initializeVulkanDevices(Config, Devices))
+    Err = llvm::joinErrors(std::move(Err), std::move(E));
 #endif
+
 #ifdef OFFLOADTEST_ENABLE_METAL
-  if (auto Err = initializeMtlDevices())
-    return Err;
+  if (auto E = initializeMetalDevices(Config, Devices))
+    Err = llvm::joinErrors(std::move(Err), std::move(E));
 #endif
-  return llvm::Error::success();
+
+  if (Devices.empty()) {
+    if (Err)
+      return std::move(Err);
+    return llvm::createStringError(std::errc::no_such_device,
+                                   "No GPU devices found.");
+  }
+  // Log errors from backends that failed while others succeeded.
+  if (Err)
+    llvm::logAllUnhandledErrors(std::move(Err), llvm::errs());
+  return Devices;
 }
 
-void Device::uninitialize() { DeviceContext::instance().unregisterDevices(); }
+llvm::Expected<std::unique_ptr<Texture>>
+offloadtest::createRenderTargetFromCPUBuffer(Device &Dev,
+                                             const CPUBuffer &Buf) {
+  auto TexFmtOrErr = toFormat(Buf.Format, Buf.Channels);
+  if (!TexFmtOrErr)
+    return TexFmtOrErr.takeError();
 
-Device::DeviceIterator Device::begin() {
-  return DeviceContext::instance().begin();
+  TextureCreateDesc Desc = {};
+  Desc.Location = MemoryLocation::GpuOnly;
+  Desc.Usage = TextureUsage::RenderTarget;
+  Desc.Fmt = *TexFmtOrErr;
+  Desc.Width = Buf.OutputProps.Width;
+  Desc.Height = Buf.OutputProps.Height;
+  Desc.MipLevels = 1;
+  Desc.OptimizedClearValue = ClearColor{};
+
+  if (auto Err = validateTextureDescMatchesCPUBuffer(Desc, Buf))
+    return Err;
+
+  return Dev.createTexture("RenderTarget", Desc);
 }
 
-Device::DeviceIterator Device::end() { return DeviceContext::instance().end(); }
+llvm::Expected<std::unique_ptr<Texture>>
+offloadtest::createDefaultDepthStencilTarget(Device &Dev, uint32_t Width,
+                                             uint32_t Height) {
+  TextureCreateDesc Desc = {};
+  Desc.Location = MemoryLocation::GpuOnly;
+  Desc.Usage = TextureUsage::DepthStencil;
+  Desc.Fmt = Format::D32FloatS8Uint;
+  Desc.Width = Width;
+  Desc.Height = Height;
+  Desc.MipLevels = 1;
+  Desc.OptimizedClearValue = ClearDepthStencil{1.0f, 0};
+
+  return Dev.createTexture("DepthStencil", Desc);
+}
+
+// This is a separate function because recursion is not allowed in this code
+// base.
+static llvm::Expected<std::unique_ptr<offloadtest::Buffer>>
+createUploadBufferWithData(Device &Dev, std::string Name, const void *Data,
+                           size_t SizeInBytes) {
+
+  // Create Upload buffer
+  const BufferCreateDesc UploadDesc = BufferCreateDesc::uploadBuffer();
+  const std::string UploadBufferName = Name + " (Upload Buffer)";
+
+  auto UploadBufferOrErr =
+      Dev.createBuffer(UploadBufferName, UploadDesc, SizeInBytes);
+  if (!UploadBufferOrErr)
+    return UploadBufferOrErr.takeError();
+  auto UploadBuffer = std::move(*UploadBufferOrErr);
+
+  // Copy data over
+  auto MappedPtrOrErr = UploadBuffer->map();
+  if (!MappedPtrOrErr)
+    return MappedPtrOrErr.takeError();
+  void *MappedPtr = *MappedPtrOrErr;
+  memcpy(MappedPtr, Data, SizeInBytes);
+  UploadBuffer->unmap();
+
+  return std::move(UploadBuffer);
+}
+
+llvm::Expected<std::unique_ptr<offloadtest::Buffer>>
+offloadtest::createBufferWithData(
+    Device &Dev, std::string Name, const BufferCreateDesc &Desc,
+    const void *Data, size_t SizeInBytes, ComputeEncoder *Encoder,
+    std::unique_ptr<offloadtest::Buffer> *OutUploadBuffer) {
+  auto BufferOrErr = Dev.createBuffer(Name, Desc, SizeInBytes);
+  if (!BufferOrErr)
+    return BufferOrErr.takeError();
+  auto Buffer = std::move(*BufferOrErr);
+
+  if (Desc.Location == MemoryLocation::GpuOnly) {
+    if (OutUploadBuffer == nullptr)
+      return llvm::createStringError(
+          "An upload buffer is required to create a GpuOnly buffer with data.");
+
+    // Create Upload buffer
+    auto UploadBufferOrErr =
+        createUploadBufferWithData(Dev, Name, Data, SizeInBytes);
+    if (!UploadBufferOrErr)
+      return UploadBufferOrErr.takeError();
+    *OutUploadBuffer = std::move(*UploadBufferOrErr);
+
+    // Copy Buffer to Buffer
+    if (auto Err = Encoder->copyBufferToBuffer(**OutUploadBuffer, 0, *Buffer, 0,
+                                               SizeInBytes))
+      return Err;
+
+  } else {
+    // Copy data over
+    auto MappedPtrOrErr = Buffer->map();
+    if (!MappedPtrOrErr)
+      return MappedPtrOrErr.takeError();
+    void *MappedPtr = *MappedPtrOrErr;
+    memcpy(MappedPtr, Data, SizeInBytes);
+    Buffer->unmap();
+  }
+
+  return Buffer;
+}

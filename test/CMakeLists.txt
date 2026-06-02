@@ -54,6 +54,9 @@ function(try_compile_hlsl output)
   message(STATUS "${output} - ${${output}}")
 endfunction()
 
+option(OFFLOADTEST_ENABLE_DEBUG "Enable available runtime debug layers (defaults On)." ON)
+option(OFFLOADTEST_ENABLE_VALIDATION "Enable available runtime validation layers (defaults Off)." OFF)
+
 list(APPEND OFFLOADTEST_DEPS
   api-query
   offloader
@@ -61,6 +64,7 @@ list(APPEND OFFLOADTEST_DEPS
   split-file
   imgdiff
   OffloadTestUnit
+  obj2yaml
   not)
 
 if (OFFLOADTEST_TEST_CLANG)
@@ -99,7 +103,9 @@ if (OFFLOADTEST_ENABLE_METAL)
   list(APPEND platforms_to_test mtl)
 endif()
 
-llvm_canonicalize_cmake_booleans(OFFLOADTEST_TEST_CLANG)
+llvm_canonicalize_cmake_booleans(OFFLOADTEST_TEST_CLANG
+                                 OFFLOADTEST_ENABLE_DEBUG
+                                 OFFLOADTEST_ENABLE_VALIDATION)
 
 foreach(platform ${platforms_to_test})
   set(TEST_${platform} False)
@@ -108,6 +114,12 @@ endforeach()
 # Because this path comes in from a user, we need to normalize it before
 # expanding it into lit.
 cmake_path(SET DXC_DIR NORMALIZE "${DXC_DIR}")
+
+# The lit.site.cfg.py.in templates expect @OFFLOADTEST_TEST_ROOT@ — the
+# directory containing test/lit.cfg.py. In an in-tree build that's the
+# project source dir; in the standalone install layout it's the install
+# share dir (set by configure-test-suite.py).
+set(OFFLOADTEST_TEST_ROOT ${OFFLOADTEST_SOURCE_DIR})
 
 function(add_offloadtest_lit_suite suite)
   configure_lit_site_cfg(
@@ -185,3 +197,50 @@ endif()
 
 umbrella_lit_testsuite_end(check-hlsl)
 set_target_properties(check-hlsl PROPERTIES FOLDER "HLSL tests")
+
+# === Standalone test suite distribution ===
+#
+# See docs/offload-distribution.md for an overview. All test infrastructure
+# is installed under a single `offload-test-suite` component. Build with
+# `ninja install-offload-test-suite`.
+set(OFFLOADTEST_INSTALL_TESTDIR "share/hlsl-test-suite" CACHE STRING
+    "Install directory (relative to CMAKE_INSTALL_PREFIX) for the standalone offload test suite distribution.")
+
+# Install the test source tree. Using two separate install(DIRECTORY) calls
+# keeps EXCLUDE patterns out of FILES_MATCHING, where EXCLUDE inside
+# FILES_MATCHING is interpreted as an include-override.
+install(DIRECTORY ${OFFLOADTEST_SOURCE_DIR}/test/
+  DESTINATION ${OFFLOADTEST_INSTALL_TESTDIR}/test
+  COMPONENT offload-test-suite
+  PATTERN "Output" EXCLUDE
+  PATTERN "__pycache__" EXCLUDE
+  PATTERN "CMakeLists.txt" EXCLUDE
+  PATTERN "*.py.in" EXCLUDE)
+
+# Install the canonical lit.site.cfg.py template so configure-test-suite.py
+# can substitute @VAR@ tokens against the same template the in-tree build
+# uses, avoiding any drift between the two code paths.
+install(FILES ${OFFLOADTEST_SOURCE_DIR}/test/lit.site.cfg.py.in
+  DESTINATION ${OFFLOADTEST_INSTALL_TESTDIR}
+  COMPONENT offload-test-suite)
+
+# Install the standalone configure script.
+install(PROGRAMS ${OFFLOADTEST_SOURCE_DIR}/utils/configure-test-suite.py
+  DESTINATION ${OFFLOADTEST_INSTALL_TESTDIR}
+  COMPONENT offload-test-suite)
+
+# If golden images were available at configure time, ship them inside the
+# distribution so the test runner doesn't need to re-checkout the repo.
+if (GOLDENIMAGE_DIR AND EXISTS "${GOLDENIMAGE_DIR}")
+  file(TO_CMAKE_PATH "${GOLDENIMAGE_DIR}" _goldenimage_dir)
+  install(DIRECTORY "${_goldenimage_dir}/"
+    DESTINATION ${OFFLOADTEST_INSTALL_TESTDIR}/golden-images
+    COMPONENT offload-test-suite
+    PATTERN ".git" EXCLUDE
+    PATTERN ".gitattributes" EXCLUDE)
+endif()
+
+if (NOT LLVM_ENABLE_IDE)
+  add_llvm_install_targets(install-offload-test-suite
+    COMPONENT offload-test-suite)
+endif()

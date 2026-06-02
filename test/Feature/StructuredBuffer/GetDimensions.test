@@ -1,0 +1,140 @@
+#--- source.hlsl
+
+// This test checks that we will get the expected values from invoking
+// `GetDimension`s on various structured buffer types. We are checking
+// that `stride` denotes the total number of bytes of a single struct,
+// and `numStructs` denote how many of the structs are in the buffer.
+
+struct R {
+    int4 a;
+};
+
+struct S {
+    int2 a;
+};
+
+StructuredBuffer<R> A : register(t0);
+RWStructuredBuffer<S> B : register(u1);
+AppendStructuredBuffer<R> C : register(u2);
+ConsumeStructuredBuffer<S> D : register(u3);
+
+[[vk::binding(10)]]
+RWBuffer<uint> Out : register(u10);
+
+[numthreads(1,1,1)]
+void main() {
+  uint numStructs, stride;
+  int i = 0;
+
+  A.GetDimensions(numStructs, stride);
+  Out[i++] = numStructs;
+  Out[i++] = stride;
+
+  B.GetDimensions(numStructs, stride);
+  Out[i++] = numStructs;
+  Out[i++] = stride;
+
+  C.GetDimensions(numStructs, stride);
+  Out[i++] = numStructs;
+  Out[i++] = stride;
+
+  D.GetDimensions(numStructs, stride);
+  Out[i++] = numStructs;
+  Out[i++] = stride;
+}
+
+//--- pipeline.yaml
+
+---
+Shaders:
+  - Stage: Compute
+    Entry: main
+
+DispatchParameters:
+  DispatchGroupCount: [4, 1, 1]
+Buffers:
+  - Name: A
+    Format: Int32
+    Stride: 16
+    Data: [ 0,1,2,3 ]
+
+  - Name: B
+    Format: Int32
+    Stride: 8
+    Data: [ 0,1,2,3,4,5,6,7 ]
+
+  - Name: C
+    Format: Int32
+    Stride: 16
+    Data: [ 0,1,2,3,4,5,6,7 ]
+
+  - Name: D
+    Format: Int32
+    Stride: 8
+    Data: [ 0,1,2,3 ]
+
+  - Name: Out
+    Format: Int32
+    FillSize: 32
+
+  - Name: ExpectedOut
+    Format: Int32
+    Data: [ 1, 16, 4, 8, 2, 16, 2, 8 ]
+
+Results:
+  - Result: Out
+    Rule: BufferExact
+    Actual: Out
+    Expected: ExpectedOut
+
+DescriptorSets:
+  - Resources:
+    - Name: A
+      Kind: StructuredBuffer
+      DirectXBinding:
+        Register: 0
+        Space: 0
+      VulkanBinding:
+        Binding: 0
+
+    - Name: B
+      Kind: RWStructuredBuffer
+      DirectXBinding:
+        Register: 1
+        Space: 0
+      VulkanBinding:
+        Binding: 1
+
+    - Name: C
+      Kind: RWStructuredBuffer
+      DirectXBinding:
+        Register: 2
+        Space: 0
+      VulkanBinding:
+        Binding: 2
+
+    - Name: D
+      Kind: RWStructuredBuffer
+      DirectXBinding:
+        Register: 3
+        Space: 0
+      VulkanBinding:
+        Binding: 3
+
+    - Name: Out
+      Kind: RWBuffer
+      DirectXBinding:
+        Register: 10
+        Space: 0
+      VulkanBinding:
+        Binding: 10
+
+...
+#--- end
+
+# Unimplemented https://github.com/llvm/llvm-project/issues/164008
+# XFAIL: Clang && Vulkan
+
+# RUN: split-file %s %t
+# RUN: %dxc_target -T cs_6_5 -Fo %t.o %t/source.hlsl
+# RUN: %offloader %t/pipeline.yaml %t.o

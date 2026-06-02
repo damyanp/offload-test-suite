@@ -16,7 +16,6 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/InitLLVM.h"
 
-
 using namespace llvm;
 using namespace offloadtest;
 
@@ -26,13 +25,31 @@ int main(int ArgC, char **ArgV) {
 
   const ExitOnError ExitOnErr("api-query: error: ");
 
-  if (auto Err = Device::initialize())
-    logAllUnhandledErrors(std::move(Err), errs(), "api-query: error: ");
+  const DeviceConfig Config;
+  auto DevicesOrErr = initializeDevices(Config);
+  if (!DevicesOrErr) {
+    logAllUnhandledErrors(DevicesOrErr.takeError(), errs(),
+                          "api-query: error: ");
+    return 1;
+  }
+  auto Devices = std::move(*DevicesOrErr);
 
   outs() << "Devices:\n";
-  for (const auto &D : Device::devices()) {
+  for (const auto &D : Devices) {
     outs() << "- API: " << D->getAPIName() << "\n";
     outs() << "  Description: " << D->getDescription() << "\n";
+    outs() << "  Driver: " << D->getDriverName() << "\n";
+    // Driver version strings can be vendor-specific freeform text that
+    // may contain ':' characters (e.g. Qualcomm's Vulkan driverInfo is
+    // "Driver Build: ..."). Emit as a double-quoted YAML scalar so
+    // lit.cfg.py's yaml.safe_load() can parse the output.
+    outs() << "  Driver Version: \"";
+    for (const char C : D->getDriverVersion()) {
+      if (C == '"' || C == '\\')
+        outs() << '\\';
+      outs() << C;
+    }
+    outs() << "\"\n";
     outs() << "  Features: \n";
     for (const auto &C : D->getCapabilities()) {
       outs() << "    ";
@@ -41,6 +58,6 @@ int main(int ArgC, char **ArgV) {
     }
     D->printExtra(outs());
   }
-  Device::uninitialize();
+
   return 0;
 }

@@ -18,7 +18,6 @@ void main() {
 Shaders:
   - Stage: Compute
     Entry: main
-    DispatchSize: [1, 1, 1]
 Buffers:
   - Name: Y
     Format: Float16
@@ -33,7 +32,7 @@ Buffers:
   - Name: Out
     Format: Float16
     Stride: 8
-    ZeroInitSize: 32
+    FillSize: 32
   - Name: ExpectedOut
     Format: Float16
     Stride: 8

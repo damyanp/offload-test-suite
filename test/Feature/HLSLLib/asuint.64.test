@@ -25,7 +25,6 @@ void main() {
 Shaders:
   - Stage: Compute
     Entry: main
-    DispatchSize: [1, 1, 1]
 Buffers:
   - Name: In0
     Format: Float64
@@ -34,7 +33,7 @@ Buffers:
   - Name: Lows
     Format: UInt32
     Stride: 16
-    ZeroInitSize: 64
+    FillSize: 64
   - Name: ExpectedLows
     Format: UInt32
     Stride: 16
@@ -42,7 +41,7 @@ Buffers:
   - Name: Highs
     Format: UInt32
     Stride: 16
-    ZeroInitSize: 64
+    FillSize: 64
   - Name: ExpectedHighs
     Format: UInt32
     Stride: 16
@@ -80,12 +79,6 @@ DescriptorSets:
       VulkanBinding:
         Binding: 2
 #--- end
-
-# https://github.com/microsoft/DirectXShaderCompiler/issues/7666
-# XFAIL: DXC-Vulkan
-
-# https://github.com/llvm/llvm-project/issues/153091
-# XFAIL: Clang-Vulkan
 
 # REQUIRES: Double
 # RUN: split-file %s %t

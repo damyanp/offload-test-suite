@@ -22,8 +22,9 @@ void main(uint GI : SV_GroupIndex) {
 Shaders:
   - Stage: Compute
     Entry: main
-    DispatchSize: [4, 2, 1]
 
+DispatchParameters:
+  DispatchGroupCount: [4, 2, 1]
 Buffers:
   - Name: CB
     Format: Int32
@@ -35,7 +36,7 @@ Buffers:
   - Name: BufOut
     Format: Int32
     Stride: 16
-    ZeroInitSize: 16
+    FillSize: 16
 
   - Name: ExpectedBufOut
     Format: Int32
@@ -66,15 +67,11 @@ DescriptorSets:
 ...
 #--- end
 
-# Resource arrays are not yet implemented in Clang:
-# https://github.com/llvm/llvm-project/issues/133835
-# XFAIL: Clang
-
-# Offload tests are missing support for resource arrays on Metal
-# https://github.com/llvm/offload-test-suite/issues/305
-# XFAIL: Metal
+# CBuffer<T> not yet implemented for DirectX
+# Unimplemented https://github.com/llvm/llvm-project/issues/122791
+# XFAIL: Clang && DirectX
+# XFAIL: Clang && Metal
 
 # RUN: split-file %s %t
-# RUN: %if !Vulkan %{ %dxc_target -T cs_6_0 -Fo %t.o %t/source.hlsl %}
-# RUN: %if Vulkan %{ %dxc_target -T cs_6_0 -fspv-target-env=vulkan1.3 -fvk-use-scalar-layout -Fo %t.o %t/source.hlsl %}
+# RUN: %dxc_target -T cs_6_0 -Fo %t.o %t/source.hlsl
 # RUN: %offloader %t/pipeline.yaml %t.o
