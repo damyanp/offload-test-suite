@@ -15,14 +15,24 @@ Usage:
 
 import sys
 import os
-import json
-import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
-OWNER = "llvm"
-REPO = "offload-test-suite"
-VALID_VENDORS = ("intel", "amd", "nvidia", "qc")
+from gh_ci import (
+    VALID_VENDORS,
+    runner_label,
+    get_runners,
+    get_runs_by_status,
+    get_jobs,
+    prefetch_jobs,
+    collapse_superseded,
+    job_matches_vendor,
+    is_test_job,
+    short_job_name,
+    run_could_match_vendor,
+    tz_abbrev,
+    format_time,
+)
+
 COMPLETED_WINDOW_HOURS = 3
 
 # ANSI color codes per vendor
@@ -34,66 +44,11 @@ VENDOR_COLORS = {
 }
 RESET = "\033[0m"
 
-# Workflow names that are exclusive to a specific vendor
-VENDOR_WORKFLOW_KEYWORDS = {
-    "intel": "intel",
-    "amd": "amd",
-    "nvidia": "nvidia",
-    "qc": "qc",
-}
-
-
-def runner_label(vendor):
-    return f"hlsl-windows-{vendor}"
-
 
 def colorize(vendor, text):
     """Wrap text in the vendor's ANSI color."""
     c = VENDOR_COLORS.get(vendor, "")
     return f"{c}{text}{RESET}" if c else text
-
-
-def api_get(path):
-    """Issue a GitHub API GET via `gh api` and return the parsed JSON.
-
-    Raises subprocess.CalledProcessError on non-zero exit (e.g. 403).
-    """
-    result = subprocess.run(
-        ["gh", "api", "-H", "Accept: application/vnd.github+json", path],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        check=True,
-    )
-    return json.loads(result.stdout)
-
-
-def get_runners(label):
-    """Fetch self-hosted runners that have the given label. Returns None on error."""
-    try:
-        path = f"/repos/{OWNER}/{REPO}/actions/runners?per_page=100"
-        runners = api_get(path).get("runners", [])
-        return [r for r in runners if label in [l["name"] for l in r.get("labels", [])]]
-    except subprocess.CalledProcessError:
-        return None
-
-
-def run_could_match_vendor(run, vendor):
-    """Quick heuristic: can this run possibly have jobs for the given vendor?
-
-    Scheduled/dispatch runs whose workflow name contains another vendor's
-    keyword are skipped. PR runs (Execution Testing) and ambiguous runs
-    are always kept.
-    """
-    name_lower = run["name"].lower()
-    # "Execution Testing" (PR matrix) always includes intel, sometimes others
-    if "execution testing" in name_lower or "hlsl test" in name_lower:
-        return True
-    # If the workflow name mentions a specific vendor, only match that one
-    for v, kw in VENDOR_WORKFLOW_KEYWORDS.items():
-        if kw in name_lower:
-            return v == vendor
-    return True
 
 
 def get_runs(vendors):
@@ -104,13 +59,11 @@ def get_runs(vendors):
     """
     results = []
     for status in ("queued", "in_progress"):
-        path = f"/repos/{OWNER}/{REPO}/actions/runs?status={status}&per_page=100"
-        results.extend(api_get(path)["workflow_runs"])
+        results.extend(get_runs_by_status(status))
 
     # Also grab recently completed runs (within COMPLETED_WINDOW_HOURS)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=COMPLETED_WINDOW_HOURS)
-    path = f"/repos/{OWNER}/{REPO}/actions/runs?status=completed&per_page=50"
-    for r in api_get(path)["workflow_runs"]:
+    for r in get_runs_by_status("completed", max_items=50):
         updated = datetime.fromisoformat(r["updated_at"].replace("Z", "+00:00"))
         if updated >= cutoff:
             results.append(r)
@@ -124,13 +77,7 @@ def get_runs(vendors):
             unique.append(r)
 
     # Collapse superseded runs, runs that have been pre-empted by newer commits
-    latest_by_key = {}
-    for r in unique:
-        key = (r["name"], r.get("head_branch"))
-        current = latest_by_key.get(key)
-        if current is None or r["created_at"] > current["created_at"]:
-            latest_by_key[key] = r
-    unique = list(latest_by_key.values())
+    unique, _superseded = collapse_superseded(unique)
 
     # Pre-filter: if only one vendor requested, skip runs that clearly
     # belong to a different vendor (avoids fetching their jobs).
@@ -139,84 +86,6 @@ def get_runs(vendors):
         unique = [r for r in unique if run_could_match_vendor(r, vendor)]
 
     return unique
-
-
-def prefetch_jobs(runs, jobs_cache):
-    """Fetch jobs for all runs in parallel to minimize wall-clock time."""
-    to_fetch = [r for r in runs if r["id"] not in jobs_cache]
-    if not to_fetch:
-        return
-
-    def fetch_one(run_id):
-        return run_id, get_jobs(run_id)
-
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(fetch_one, r["id"]): r["id"] for r in to_fetch}
-        for future in as_completed(futures):
-            run_id, jobs = future.result()
-            jobs_cache[run_id] = jobs
-
-
-def get_jobs(run_id):
-    path = f"/repos/{OWNER}/{REPO}/actions/runs/{run_id}/jobs?per_page=100"
-    return api_get(path)["jobs"]
-
-
-def job_sku_vendor(job):
-    # Return the vendor implied by the matrix SKU in the job name, or None.
-    name_lower = (job.get("name") or "").lower()
-    for v in VALID_VENDORS:
-        if f"windows-{v}" in name_lower:
-            return v
-    return None
-
-
-def job_matches_vendor(job, vendor, label):
-    # Decide whether a job belongs to the given vendor.
-
-    sku_vendor = job_sku_vendor(job)
-    if sku_vendor is not None:
-        return sku_vendor == vendor
-    return (
-        label in job.get("labels", [])
-        or vendor.lower() in (job.get("runner_name") or "").lower()
-    )
-
-
-def is_test_job(job):
-    """A split-build matrix entry's test phase, named "<entry> / test"."""
-    return (job.get("name") or "").endswith(" / test")
-
-
-def short_job_name(job):
-    """Strip the "/ build" or "/ test" phase suffix and matrix prefix."""
-    name = job.get("name") or ""
-    for suffix in (" / build", " / test"):
-        if name.endswith(suffix):
-            name = name[: -len(suffix)]
-            break
-    return name.split(",")[-1].strip().rstrip(")")
-
-
-def tz_abbrev(dt):
-    """Get short timezone abbreviation, e.g. 'PDT' instead of 'Pacific Daylight Time'."""
-    name = dt.strftime("%Z")
-    if len(name) <= 5:
-        return name
-    return "".join(w[0] for w in name.split())
-
-
-def format_time(iso_str):
-    """Convert ISO timestamp to short time like '12:40 PM PDT / 7:40 PM UTC'."""
-    dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-    h = dt.hour % 12 or 12
-    ampm = "AM" if dt.hour < 12 else "PM"
-    utc = f"{h}:{dt.minute:02d} {ampm} UTC"
-    local = dt.astimezone()
-    lh = local.hour % 12 or 12
-    lampm = "AM" if local.hour < 12 else "PM"
-    tz = tz_abbrev(local)
-    return f"{lh}:{local.minute:02d} {lampm} {tz} / {utc}"
 
 
 def print_vendor_table(vendor, runs, jobs_cache, runners_cache):

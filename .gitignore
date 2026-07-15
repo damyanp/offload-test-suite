@@ -60,3 +60,5 @@ pythonenv*
 # clangd index. (".clangd" is a config file now, thus trailing slash)
 .clangd/
 .cache
+# Generated CI contention timeline (utils/ci_timeline.py output)
+ci_timeline.html
