@@ -797,6 +797,16 @@ const arrow = new Arrow(timeline, DATA.arrows, {
 let frozenRun = null;   // runId whose highlight is pinned, or null
 let hlIds = [];         // item ids currently carrying the 'hl' class
 
+function showRunArrows(runId) {
+  // timeline-arrows keeps paths in dependency order but has no public styling
+  // API, so adjust those paths directly while preserving every arrow.
+  arrow._dependencyPath.forEach((path, index) => {
+    const dep = DATA.arrows[index];
+    const depRun = itemRun[dep.id_item_1];
+    path.style.opacity = runId == null || depRun === runId ? '1' : '0.12';
+  });
+}
+
 function clearHl() {
   if (hlIds.length) {
     const upd = hlIds.map(id => {
@@ -808,6 +818,7 @@ function clearHl() {
     hlIds = [];
   }
   container.classList.remove('dimming');
+  showRunArrows(null);
 }
 
 function showHl(runId) {
@@ -820,6 +831,7 @@ function showHl(runId) {
     const it = items.get(id);
     return { id, className: it.className + ' hl' };
   }));
+  showRunArrows(runId);
 }
 
 timeline.on('itemover', props => {
