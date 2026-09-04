@@ -1,0 +1,84 @@
+#--- source.hlsl
+
+RWStructuredBuffer<uint> Out : register(u0);
+
+groupshared uint Payload[319];
+groupshared uint Flag[319];
+
+[numthreads(319, 1, 1)]
+void main(uint3 GTID : SV_GroupThreadID) {
+  uint TID = GTID.x;
+  uint WindowBase = (TID / 13u) * 13u;
+  uint WindowSize = min(13u, 319u - WindowBase);
+  uint Other = WindowBase + ((TID + 5u) % WindowSize);
+  uint Faults = 0u;
+  Payload[TID] = 0u;
+  Flag[TID] = 0u;
+
+  GroupMemoryBarrierWithGroupSync();
+
+  // Start each update after all threads complete the prior update.
+  for (uint Update = 1u; Update < 65u; ++Update) {
+    GroupMemoryBarrierWithGroupSync();
+
+    Payload[TID] = Update;
+
+    // Complete the payload update before this thread sets its flag.
+    GroupMemoryBarrier();
+
+    Flag[TID] = Update;
+
+    // Read one thread in this window many times. Some windows cross waves.
+    for (uint Check = 0u; Check < 33u; ++Check) {
+      uint OtherFlag = Flag[Other];
+
+      // Complete the flag read before this thread reads the payload.
+      GroupMemoryBarrier();
+
+      uint OtherPayload = Payload[Other];
+      if (OtherFlag == Update && OtherPayload != Update)
+        ++Faults;
+      if (OtherPayload == Update - 1u && OtherFlag != Update - 1u)
+        ++Faults;
+
+      GroupMemoryBarrier();
+    }
+  }
+
+  Out[TID] = Faults;
+}
+
+//--- pipeline.yaml
+---
+Shaders:
+  - Stage: Compute
+    Entry: main
+Buffers:
+  - Name: Out
+    Format: UInt32
+    Stride: 4
+    FillSize: 1276
+  - Name: ExpectedOut
+    Format: UInt32
+    Stride: 4
+    FillSize: 1276
+Results:
+  - Result: GroupMemoryBarrier
+    Rule: BufferExact
+    Actual: Out
+    Expected: ExpectedOut
+DescriptorSets:
+  - Resources:
+    - Name: Out
+      Kind: RWStructuredBuffer
+      DirectXBinding:
+        Register: 0
+        Space: 0
+      VulkanBinding:
+        Binding: 0
+...
+#--- end
+
+# RUN: split-file %s %t
+# RUN: %dxc_target -T cs_6_5 -Fo %t.o %t/source.hlsl
+# RUN: %offloader %t/pipeline.yaml %t.o
